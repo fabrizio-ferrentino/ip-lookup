@@ -15,7 +15,8 @@ Arguments:
     input: text file with one IP per line (or several IPs separated by commas/spaces/semicolons)
     -o, --output: destination CSV file (default: report_ip.csv)
     --abuse-key: AbuseIPDB key (alternatively: ABUSEIPDB_KEY environment variable)
-    --no-cache: ignore the cache and fetch everything from scratch
+    --no-cache: fetch everything again, ignoring what is already stored
+                (the cache is refreshed, never deleted)
 
 CSV columns:
     picked in the COLUMNS dictionary below, by putting True or False next to
@@ -97,9 +98,20 @@ def active_columns():
 # ---------------------------------------------------------------------------
 
 class Cache:
-    """Small file-backed store, so the same request is not repeated."""
+    """Small file-backed store, so the same request is not repeated.
 
-    def __init__(self, path=CACHE_DB):
+    Writes are queued and committed in groups by flush(). One commit per
+    entry means one fsync per entry, which on ~15k IPs costs about 25
+    seconds against 0.1 for a single transaction.
+    """
+
+    def __init__(self, path=CACHE_DB, ignore_existing=False):
+        # ignore_existing: every lookup misses, but new answers are still
+        # stored. This is what --no-cache does, so that refreshing the
+        # geolocation does not throw away the AbuseIPDB results, which
+        # cost daily quota.
+        self.ignore_existing = ignore_existing
+        self.pending = []
         self.conn = sqlite3.connect(path)
         self.conn.execute(
             """CREATE TABLE IF NOT EXISTS entries (
@@ -111,6 +123,8 @@ class Cache:
         self.conn.commit()
 
     def get(self, key):
+        if self.ignore_existing:
+            return None
         row = self.conn.execute(
             "SELECT payload, fetched_at FROM entries WHERE key = ?", (key,)
         ).fetchone()
@@ -122,13 +136,22 @@ class Cache:
         return json.loads(payload)
 
     def put(self, key, value):
-        self.conn.execute(
+        """Queue an entry. Nothing reaches the disk until flush()."""
+        self.pending.append((key, json.dumps(value), time.time()))
+
+    def flush(self):
+        """Commit the queued entries in a single transaction."""
+        if not self.pending:
+            return
+        self.conn.executemany(
             "INSERT OR REPLACE INTO entries (key, payload, fetched_at) VALUES (?, ?, ?)",
-            (key, json.dumps(value), time.time()),
+            self.pending,
         )
         self.conn.commit()
+        self.pending.clear()
 
     def close(self):
+        self.flush()
         self.conn.close()
 
 
@@ -137,14 +160,19 @@ class Cache:
 # ---------------------------------------------------------------------------
 
 def read_ips(path):
-    """Read the input file and return (valid_ips, skipped_ips).
+    """Read the input file and return (valid_ips, skipped).
 
     Accepts one IP per line, or several IPs separated by commas, spaces
     or semicolons (e.g. "79.6.172.189, 23.206.214.188, 10.67.112.28").
     Empty lines and lines starting with # are ignored.
+
+    'skipped' is {address: [reason, occurrences]}, one entry per distinct
+    rejected address. Deduplication happens before the private-range test
+    on purpose: an input file where the same internal IP repeats hundreds
+    of thousands of times must not build a list just as long.
     """
     valid = []
-    skipped = []
+    skipped = {}
     already_seen = set()
 
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -164,15 +192,23 @@ def read_ips(path):
                 except ValueError:
                     continue  # not a valid IP, silently ignored
 
-                if address.is_private or address.is_loopback or address.is_reserved or address.is_link_local or address.is_multicast:
-                    skipped.append((candidate, "private/local/reserved/link-local/multicast IP"))
+                # normalised form, so the many ways of writing the same
+                # IPv6 address collapse into one cache key
+                key = str(address)
+
+                if key in skipped:
+                    skipped[key][1] += 1
                     continue
 
-                if candidate in already_seen:
+                if key in already_seen:
                     continue  # duplicate
 
-                already_seen.add(candidate)
-                valid.append(candidate)
+                if address.is_private or address.is_loopback or address.is_reserved or address.is_link_local or address.is_multicast:
+                    skipped[key] = ["private/local/reserved/link-local/multicast IP", 1]
+                    continue
+
+                already_seen.add(key)
+                valid.append(key)
 
     return valid, skipped
 
@@ -241,13 +277,29 @@ def geolocate(ips, cache):
             print(f"  batch {number}: HTTP {response.status_code} response, skipping it")
             continue
 
-        for item in response.json():
+        # a 200 does not guarantee JSON: a captive portal or a company
+        # proxy answers with an HTML page and would crash the whole run
+        try:
+            payload = response.json()
+        except ValueError:
+            print(f"  batch {number}: response is not valid JSON, skipping it")
+            continue
+
+        if not isinstance(payload, list):
+            print(f"  batch {number}: unexpected response {payload!r}, skipping it")
+            continue
+
+        for item in payload:
             ip = item.get("query")
             if not ip:
                 continue
             results[ip] = item
-            cache.put("geo:" + ip, item)
+            # only successful answers are cached: a temporary "fail" would
+            # otherwise stay frozen for a whole week
+            if item.get("status") == "success":
+                cache.put("geo:" + ip, item)
 
+        cache.flush()
         print(f"  batch {number}/{len(chunks)} done")
 
         if number < len(chunks):
@@ -303,9 +355,17 @@ def reputation(ips, api_key, cache, daily_limit=1000):
             print(f"  {ip}: HTTP {response.status_code} response, skipping it")
             continue
 
-        data = response.json().get("data", {})
+        try:
+            data = response.json().get("data", {})
+        except ValueError:
+            print(f"  {ip}: response is not valid JSON, skipping it")
+            continue
+
         results[ip] = data
         cache.put("abuse:" + ip, data)
+        # committed straight away: each of these answers costs a slot of
+        # the daily quota, and the 0.6s pause below dwarfs the fsync
+        cache.flush()
 
         if number % 50 == 0:
             print(f"  {number}/{len(to_fetch)}")
@@ -441,7 +501,9 @@ def main():
                         help="AbuseIPDB key (alternatively: ABUSEIPDB_KEY "
                              "environment variable)")
     parser.add_argument("--no-cache", action="store_true",
-                        help="ignore the cache and fetch everything from scratch")
+                        help="fetch everything again, ignoring what is already "
+                             "stored; the cache is updated with the fresh "
+                             "answers, nothing is deleted")
     args = parser.parse_args()
 
     check_columns()
@@ -453,18 +515,17 @@ def main():
     ips, skipped = read_ips(args.input)
     print(f"Read {len(ips)} valid, distinct IPs.")
     if skipped:
-        print(f"Skipped {len(skipped)} values. First 5:")
-        for value, reason in skipped[:5]:
-            print(f"  {value} -> {reason}")
+        occurrences = sum(count for _, count in skipped.values())
+        print(f"Skipped {len(skipped)} distinct values "
+              f"({occurrences} occurrences). First 5:")
+        for value, (reason, count) in list(skipped.items())[:5]:
+            print(f"  {value} (x{count}) -> {reason}")
 
     if not ips:
         print("Nothing to analyse.")
         sys.exit(0)
 
-    if args.no_cache and os.path.exists(CACHE_DB):
-        os.remove(CACHE_DB)
-
-    cache = Cache()
+    cache = Cache(ignore_existing=args.no_cache)
     try:
         geo_data = geolocate(ips, cache)
         abuse_data = reputation(ips, args.abuse_key, cache)
