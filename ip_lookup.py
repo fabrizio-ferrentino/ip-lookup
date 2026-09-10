@@ -21,6 +21,8 @@ Arguments:
 CSV columns:
     picked in the COLUMNS dictionary below, by putting True or False next to
     the name. Moving the lines around also changes their order in the report.
+    'message' is off by default: it only fills in when a lookup fails, and
+    the summary counts those failures anyway.
 
 Dependencies:
     pip install requests
@@ -34,6 +36,7 @@ import os
 import sqlite3
 import sys
 import time
+from collections import Counter
 
 import requests
 
@@ -44,11 +47,13 @@ import requests
 
 # ip-api.com: free, no sign-up, "batch" endpoint takes 100 IPs at a time.
 # The free plan allows about 15 batch calls per minute -> ~1500 IPs/minute.
-# If you get temporarily banned (HTTP 429), raise BATCH_PAUSE.
+# The exact pace is taken from the X-Rl / X-Ttl response headers; BATCH_PAUSE
+# is only the fallback for when those headers are missing.
 IPAPI_URL = "http://ip-api.com/batch"
 IPAPI_FIELDS = "status,message,query,country,countryCode,regionName,city,zip,lat,lon,isp,org,as,asname,proxy,hosting,mobile"
 BATCH_SIZE = 100
 BATCH_PAUSE = 4.5  # seconds to wait between one batch and the next
+POLITE_PAUSE = 0.5  # between batches, while the rate-limit window has room
 
 # AbuseIPDB: free but you must register on abuseipdb.com to get a key.
 # Free plan: 1000 checks a day, one IP per call.
@@ -68,6 +73,7 @@ CACHE_TTL = 7 * 24 * 3600  # one week, in seconds
 COLUMNS = {
     "ip":            True,
     "status":        True,
+    "message":       False,  # why a lookup failed; empty when it succeeded
     "country":       True,
     "country_code":  True,
     "region":        True,
@@ -150,6 +156,19 @@ class Cache:
         self.conn.commit()
         self.pending.clear()
 
+    def purge_expired(self):
+        """Delete entries past CACHE_TTL and return how many went.
+
+        get() already ignores them, so without this they would sit in the
+        file for ever, growing it with rows nothing will ever read again.
+        """
+        cutoff = time.time() - CACHE_TTL
+        removed = self.conn.execute(
+            "DELETE FROM entries WHERE fetched_at < ?", (cutoff,)
+        ).rowcount
+        self.conn.commit()
+        return removed
+
     def close(self):
         self.flush()
         self.conn.close()
@@ -220,10 +239,52 @@ def in_chunks(items, size):
 
 
 # ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+def new_session():
+    """One connection pool reused by every call.
+
+    requests.get/post open a fresh connection each time. Over a full run
+    that is one handshake per batch for ip-api and, worse, one TLS
+    handshake per IP for AbuseIPDB: on 1000 IPs it adds up to minutes
+    spent doing nothing but shaking hands.
+    """
+    session = requests.Session()
+    session.headers.update({"User-Agent": "ip_lookup"})
+    return session
+
+
+def wait_for_rate_limit(response, fallback=BATCH_PAUSE):
+    """Pause between batches following ip-api's own headers.
+
+    ip-api reports X-Rl (calls left in the current window) and X-Ttl
+    (seconds until it resets). Reading them beats guessing a fixed delay:
+    when the window still has room a short pause is enough, and when it
+    runs out, waiting exactly X-Ttl is what avoids the 429 instead of
+    recovering from it. Falls back to the fixed pause if the headers are
+    missing or unreadable, which is what a proxy in the middle may cause.
+    """
+    try:
+        left = int(response.headers.get("X-Rl", -1))
+        ttl = int(response.headers.get("X-Ttl", -1))
+    except (TypeError, ValueError):
+        left = ttl = -1
+
+    if left < 0 or ttl < 0:
+        time.sleep(fallback)
+    elif left == 0:
+        print(f"  rate-limit window used up, waiting {ttl + 1}s...")
+        time.sleep(ttl + 1)
+    else:
+        time.sleep(POLITE_PAUSE)
+
+
+# ---------------------------------------------------------------------------
 # GEOLOCATION AND ISP (ip-api.com)
 # ---------------------------------------------------------------------------
 
-def geolocate(ips, cache):
+def geolocate(ips, cache, session):
     """Return a dictionary {ip: geo_data} for every IP passed in."""
     results = {}
     to_fetch = []
@@ -250,7 +311,7 @@ def geolocate(ips, cache):
         response = None
         for attempt in range(max_retries):
             try:
-                response = requests.post(IPAPI_URL, json=body, timeout=30)
+                response = session.post(IPAPI_URL, json=body, timeout=30)
                 break
             except requests.RequestException as error:
                 if attempt < max_retries - 1:
@@ -268,7 +329,7 @@ def geolocate(ips, cache):
             print("  rate limit reached, waiting 60 seconds...")
             time.sleep(60)
             try:
-                response = requests.post(IPAPI_URL, json=body, timeout=30)
+                response = session.post(IPAPI_URL, json=body, timeout=30)
             except requests.RequestException as error:
                 print(f"  batch {number}: network error ({error}), skipping it")
                 continue
@@ -303,7 +364,7 @@ def geolocate(ips, cache):
         print(f"  batch {number}/{len(chunks)} done")
 
         if number < len(chunks):
-            time.sleep(BATCH_PAUSE)
+            wait_for_rate_limit(response)
 
     return results
 
@@ -312,7 +373,7 @@ def geolocate(ips, cache):
 # REPUTATION (AbuseIPDB)
 # ---------------------------------------------------------------------------
 
-def reputation(ips, api_key, cache, daily_limit=1000):
+def reputation(ips, api_key, cache, session, daily_limit=1000):
     """Return {ip: reputation_data}. Returns empty if the key is missing."""
     if not api_key:
         print("Reputation: no AbuseIPDB key, skipping.")
@@ -340,7 +401,7 @@ def reputation(ips, api_key, cache, daily_limit=1000):
         params = {"ipAddress": ip, "maxAgeInDays": 90}
 
         try:
-            response = requests.get(
+            response = session.get(
                 ABUSE_URL, headers=headers, params=params, timeout=20
             )
         except requests.RequestException as error:
@@ -387,6 +448,7 @@ def build_row(ip, geo, abuse):
     return {
         "ip": ip,
         "status": geo.get("status", "unknown"),
+        "message": geo.get("message", ""),
         "country": geo.get("country", ""),
         "country_code": geo.get("countryCode", ""),
         "region": geo.get("regionName", ""),
@@ -459,30 +521,31 @@ def print_summary(rows):
     if not rows:
         return
 
-    countries = {}
-    isps = {}
-    suspicious = 0
+    countries = Counter(row["country"] or "?" for row in rows)
+    isps = Counter(row["isp"] or "?" for row in rows)
+    suspicious = sum(1 for row in rows
+                     if row["proxy_vpn"] == "yes" or row["hosting"] == "yes")
 
-    for row in rows:
-        country = row["country"] or "?"
-        countries[country] = countries.get(country, 0) + 1
-
-        provider = row["isp"] or "?"
-        isps[provider] = isps.get(provider, 0) + 1
-
-        if row["proxy_vpn"] == "yes" or row["hosting"] == "yes":
-            suspicious += 1
+    # the reason a lookup failed is in a column that is off by default,
+    # so without this the failures would pass unnoticed
+    failures = Counter(row["message"] or row["status"]
+                       for row in rows if row["status"] != "success")
 
     print("\n--- SUMMARY ---")
     print(f"IPs analysed: {len(rows)}")
     print(f"Proxy/VPN or hosting: {suspicious}")
 
+    if failures:
+        print(f"Failed lookups: {sum(failures.values())}")
+        for reason, count in failures.most_common():
+            print(f"  {reason}: {count}")
+
     print("\nTop 5 countries:")
-    for name, count in sorted(countries.items(), key=lambda x: -x[1])[:5]:
+    for name, count in countries.most_common(5):
         print(f"  {name}: {count}")
 
     print("\nTop 5 ISPs:")
-    for name, count in sorted(isps.items(), key=lambda x: -x[1])[:5]:
+    for name, count in isps.most_common(5):
         print(f"  {name}: {count}")
 
 
@@ -506,6 +569,13 @@ def main():
                              "answers, nothing is deleted")
     args = parser.parse_args()
 
+    # a Windows console is usually cp1252: an ISP name in Cyrillic or Greek
+    # would raise UnicodeEncodeError on the very last print, after the CSV
+    # has already been written. Replacing the odd character beats losing
+    # the summary.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+
     check_columns()
 
     if not os.path.exists(args.input):
@@ -526,11 +596,17 @@ def main():
         sys.exit(0)
 
     cache = Cache(ignore_existing=args.no_cache)
+    session = new_session()
     try:
-        geo_data = geolocate(ips, cache)
-        abuse_data = reputation(ips, args.abuse_key, cache)
+        expired = cache.purge_expired()
+        if expired:
+            print(f"Cache: removed {expired} expired entries.")
+
+        geo_data = geolocate(ips, cache, session)
+        abuse_data = reputation(ips, args.abuse_key, cache, session)
     finally:
         cache.close()
+        session.close()
 
     rows = [
         build_row(ip, geo_data.get(ip), abuse_data.get(ip))
@@ -543,4 +619,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # the cache is flushed by the finally in main(), so a long run can
+        # be stopped and picked up again later without losing the work
+        print("\nInterrupted. Everything fetched so far is in the cache.")
+        sys.exit(130)
