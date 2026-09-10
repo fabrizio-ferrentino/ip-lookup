@@ -1,0 +1,18 @@
+# ambiente virtuale: non va mai messo sotto git, si ricrea con requirements.txt
+venv/
+.venv/
+
+# file generati dallo script
+cache_ip.sqlite
+*.sqlite
+report_ip*.csv
+
+# dati di input: grossi e non hanno senso sotto git
+ip/
+
+# roba di Python
+__pycache__/
+*.pyc
+
+# eventuali segreti
+.env
